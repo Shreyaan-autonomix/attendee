@@ -7,128 +7,19 @@ import threading
 import time
 from time import sleep
 
-import cv2
 import numpy as np
 import requests
-import undetected_chromedriver as uc
 from pyvirtualdisplay import Display
+from selenium import webdriver
 from websockets.sync.server import serve
 
 from bots.bot_adapter import BotAdapter
 from bots.bot_controller.automatic_leave_configuration import AutomaticLeaveConfiguration
+from bots.utils import half_ceil, scale_i420
 
 from .ui_methods import UiRequestToJoinDeniedException, UiRetryableException
 
 logger = logging.getLogger(__name__)
-
-
-def half_ceil(x):
-    return (x + 1) // 2
-
-
-def scale_i420(frame, frame_size, new_size):
-    """
-    Scales an I420 (YUV 4:2:0) frame from 'frame_size' to 'new_size',
-    handling odd frame widths/heights by using 'ceil' in the chroma planes.
-
-    :param frame:      A bytes object containing the raw I420 frame data.
-    :param frame_size: (orig_width, orig_height)
-    :param new_size:   (new_width, new_height)
-    :return:           A bytes object with the scaled I420 frame.
-    """
-
-    # 1) Unpack source / destination dimensions
-    orig_width, orig_height = frame_size
-    new_width, new_height = new_size
-
-    # 2) Compute source plane sizes with rounding up for chroma
-    orig_chroma_width = half_ceil(orig_width)
-    orig_chroma_height = half_ceil(orig_height)
-
-    y_plane_size = orig_width * orig_height
-    uv_plane_size = orig_chroma_width * orig_chroma_height  # for each U or V
-
-    # 3) Extract Y, U, V planes from the byte array
-    y = np.frombuffer(frame[0:y_plane_size], dtype=np.uint8)
-    u = np.frombuffer(frame[y_plane_size : y_plane_size + uv_plane_size], dtype=np.uint8)
-    v = np.frombuffer(
-        frame[y_plane_size + uv_plane_size : y_plane_size + 2 * uv_plane_size],
-        dtype=np.uint8,
-    )
-
-    # 4) Reshape planes
-    y = y.reshape(orig_height, orig_width)
-    u = u.reshape(orig_chroma_height, orig_chroma_width)
-    v = v.reshape(orig_chroma_height, orig_chroma_width)
-
-    # ---------------------------------------------------------
-    # Scale preserving aspect ratio or do letterbox/pillarbox
-    # ---------------------------------------------------------
-    input_aspect = orig_width / orig_height
-    output_aspect = new_width / new_height
-
-    if abs(input_aspect - output_aspect) < 1e-6:
-        # Same aspect ratio; do a straightforward resize
-        scaled_y = cv2.resize(y, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
-
-        # For U, V we should scale to half-dimensions (rounded up)
-        # of the new size. But OpenCV requires exact (int) dims, so:
-        target_u_width = half_ceil(new_width)
-        target_u_height = half_ceil(new_height)
-
-        scaled_u = cv2.resize(u, (target_u_width, target_u_height), interpolation=cv2.INTER_LINEAR)
-        scaled_v = cv2.resize(v, (target_u_width, target_u_height), interpolation=cv2.INTER_LINEAR)
-
-        # Flatten and return
-        return np.concatenate([scaled_y.flatten(), scaled_u.flatten(), scaled_v.flatten()]).astype(np.uint8).tobytes()
-
-    # Otherwise, the aspect ratios differ => letterbox or pillarbox
-    if input_aspect > output_aspect:
-        # The image is relatively wider => match width, shrink height
-        scaled_width = new_width
-        scaled_height = int(round(new_width / input_aspect))
-    else:
-        # The image is relatively taller => match height, shrink width
-        scaled_height = new_height
-        scaled_width = int(round(new_height * input_aspect))
-
-    # 5) Resize Y, U, and V to the scaled dimensions
-    scaled_y = cv2.resize(y, (scaled_width, scaled_height), interpolation=cv2.INTER_LINEAR)
-
-    # For U, V, use half-dimensions of the scaled result, rounding up.
-    scaled_u_width = half_ceil(scaled_width)
-    scaled_u_height = half_ceil(scaled_height)
-    scaled_u = cv2.resize(u, (scaled_u_width, scaled_u_height), interpolation=cv2.INTER_LINEAR)
-    scaled_v = cv2.resize(v, (scaled_u_width, scaled_u_height), interpolation=cv2.INTER_LINEAR)
-
-    # 6) Create the output buffers. For "dark" black:
-    #    Y=0, U=128, V=128.
-    final_y = np.zeros((new_height, new_width), dtype=np.uint8)
-    final_u = np.full((half_ceil(new_height), half_ceil(new_width)), 128, dtype=np.uint8)
-    final_v = np.full((half_ceil(new_height), half_ceil(new_width)), 128, dtype=np.uint8)
-
-    # 7) Compute centering offsets for each plane (Y first)
-    offset_y = (new_height - scaled_height) // 2
-    offset_x = (new_width - scaled_width) // 2
-
-    final_y[offset_y : offset_y + scaled_height, offset_x : offset_x + scaled_width] = scaled_y
-
-    # Offsets for U and V planes are half of the Y offsets (integer floor)
-    offset_y_uv = offset_y // 2
-    offset_x_uv = offset_x // 2
-
-    final_u[
-        offset_y_uv : offset_y_uv + scaled_u_height,
-        offset_x_uv : offset_x_uv + scaled_u_width,
-    ] = scaled_u
-    final_v[
-        offset_y_uv : offset_y_uv + scaled_u_height,
-        offset_x_uv : offset_x_uv + scaled_u_width,
-    ] = scaled_v
-
-    # 8) Flatten back to I420 layout and return bytes
-
-    return np.concatenate([final_y.flatten(), final_u.flatten(), final_v.flatten()]).astype(np.uint8).tobytes()
 
 
 class WebBotAdapter(BotAdapter):
@@ -141,6 +32,7 @@ class WebBotAdapter(BotAdapter):
         add_video_frame_callback,
         wants_any_video_frames_callback,
         add_mixed_audio_chunk_callback,
+        add_encoded_mp4_chunk_callback,
         upsert_caption_callback,
         automatic_leave_configuration: AutomaticLeaveConfiguration,
     ):
@@ -149,6 +41,7 @@ class WebBotAdapter(BotAdapter):
         self.add_mixed_audio_chunk_callback = add_mixed_audio_chunk_callback
         self.add_video_frame_callback = add_video_frame_callback
         self.wants_any_video_frames_callback = wants_any_video_frames_callback
+        self.add_encoded_mp4_chunk_callback = add_encoded_mp4_chunk_callback
         self.upsert_caption_callback = upsert_caption_callback
 
         self.meeting_url = meeting_url
@@ -170,12 +63,20 @@ class WebBotAdapter(BotAdapter):
         self.last_media_message_processed_time = None
         self.last_audio_message_processed_time = None
         self.first_buffer_timestamp_ms_offset = time.time() * 1000
+        self.media_sending_enable_timestamp_ms = None
 
         self.participants_info = {}
         self.only_one_participant_in_meeting_at = None
         self.video_frame_ticker = 0
 
         self.automatic_leave_configuration = automatic_leave_configuration
+
+    def process_encoded_mp4_chunk(self, message):
+        self.last_media_message_processed_time = time.time()
+        if len(message) > 4:
+            encoded_mp4_data = message[4:]
+            logger.info(f"encoded mp4 data length {len(encoded_mp4_data)}")
+            self.add_encoded_mp4_chunk_callback(encoded_mp4_data)
 
     def get_participant(self, participant_id):
         if participant_id in self.participants_info:
@@ -288,10 +189,16 @@ class WebBotAdapter(BotAdapter):
                             else:
                                 self.only_one_participant_in_meeting_at = None
 
+                        elif json_data.get("type") == "SilenceStatus":
+                            if not json_data.get("isSilent"):
+                                self.last_audio_message_processed_time = time.time()
+
                 elif message_type == 2:  # VIDEO
                     self.process_video_frame(message)
                 elif message_type == 3:  # AUDIO
                     self.process_audio_frame(message)
+                elif message_type == 4:  # ENCODED_MP4_CHUNK
+                    self.process_encoded_mp4_chunk(message)
 
                 self.last_websocket_message_processed_time = time.time()
         except Exception as e:
@@ -353,12 +260,10 @@ class WebBotAdapter(BotAdapter):
         )
 
     def init_driver(self):
-        log_path = "chromedriver.log"
-
-        options = uc.ChromeOptions()
+        options = webdriver.ChromeOptions()
 
         options.add_argument("--use-fake-ui-for-media-stream")
-        options.add_argument("--window-size=1920x1080")
+        options.add_argument("--start-maximized")
         options.add_argument("--no-sandbox")
         # options.add_argument('--headless=new')
         options.add_argument("--disable-gpu")
@@ -366,6 +271,7 @@ class WebBotAdapter(BotAdapter):
         options.add_argument("--disable-application-cache")
         options.add_argument("--disable-setuid-sandbox")
         options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-blink-features=AutomationControlled")
 
         if self.driver:
             # Simulate closing browser window
@@ -380,12 +286,8 @@ class WebBotAdapter(BotAdapter):
                 logger.info(f"Error closing existing driver: {e}")
             self.driver = None
 
-        self.driver = uc.Chrome(
-            service_log_path=log_path,
-            use_subprocess=True,
-            options=options,
-            version_main=133,
-        )
+        self.driver = webdriver.Chrome(options=options)
+        logger.info(f"web driver server initialized at port {self.driver.service.port}")
 
         initial_data_code = f"window.initialData = {{websocketPort: {self.websocket_port}}}"
 
@@ -465,15 +367,13 @@ class WebBotAdapter(BotAdapter):
             num_retries += 1
             sleep(1)
 
-        # Trying making it smaller so GMeet sends smaller video frames
-        self.driver.set_window_size(1920 / 2, 1080 / 2)
-
         self.send_message_callback({"message": self.Messages.BOT_JOINED_MEETING})
         self.send_message_callback({"message": self.Messages.BOT_RECORDING_PERMISSION_GRANTED})
 
         self.send_frames = True
         self.driver.execute_script("window.ws?.enableMediaSending();")
         self.first_buffer_timestamp_ms_offset = self.driver.execute_script("return performance.timeOrigin;")
+        self.media_sending_enable_timestamp_ms = time.time() * 1000
 
     def leave(self):
         if self.left_meeting:
@@ -548,9 +448,12 @@ class WebBotAdapter(BotAdapter):
 
         if self.last_audio_message_processed_time is not None:
             if time.time() - self.last_audio_message_processed_time > self.automatic_leave_configuration.silence_threshold_seconds:
-                logger.info(f"Auto-leaving meeting because there was no media message for {self.automatic_leave_configuration.silence_threshold_seconds} seconds")
+                logger.info(f"Auto-leaving meeting because there was no audio for {self.automatic_leave_configuration.silence_threshold_seconds} seconds")
                 self.send_message_callback({"message": self.Messages.ADAPTER_REQUESTED_BOT_LEAVE_MEETING, "leave_reason": BotAdapter.LEAVE_REASON.AUTO_LEAVE_SILENCE})
                 return
 
     def send_raw_audio(self, bytes, sample_rate):
         logger.info("send_raw_audio not supported in google meet bots")
+
+    def send_raw_image(self, image_bytes):
+        logger.info("send_raw_image not supported in google meet bots")

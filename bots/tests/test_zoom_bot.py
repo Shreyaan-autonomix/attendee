@@ -24,6 +24,7 @@ from bots.models import (
     BotMediaRequestStates,
     BotStates,
     Credentials,
+    CreditTransaction,
     MediaBlob,
     Organization,
     Project,
@@ -35,7 +36,7 @@ from bots.models import (
     TranscriptionProviders,
     TranscriptionTypes,
 )
-from bots.utils import mp3_to_pcm, png_to_yuv420_frame
+from bots.utils import mp3_to_pcm, png_to_yuv420_frame, scale_i420
 
 from .mock_data import MockPCMAudioFrame, MockVideoFrame
 
@@ -305,6 +306,7 @@ class TestZoomBot(TransactionTestCase):
 
         # Set required environment variables
         os.environ["AWS_RECORDING_STORAGE_BUCKET_NAME"] = "test-bucket"
+        os.environ["CHARGE_CREDITS_FOR_BOTS"] = "true"
 
     def setUp(self):
         # Recreate organization and project for each test
@@ -339,7 +341,7 @@ class TestZoomBot(TransactionTestCase):
         BotEventManager.create_event(self.bot, BotEventTypes.JOIN_REQUESTED)
 
         self.test_mp3_bytes = base64.b64decode("SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU2LjM2LjEwMAAAAAAAAAAAAAAA//OEAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAEAAABIADAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV6urq6urq6urq6urq6urq6urq6urq6urq6v////////////////////////////////8AAAAATGF2YzU2LjQxAAAAAAAAAAAAAAAAJAAAAAAAAAAAASDs90hvAAAAAAAAAAAAAAAAAAAA//MUZAAAAAGkAAAAAAAAA0gAAAAATEFN//MUZAMAAAGkAAAAAAAAA0gAAAAARTMu//MUZAYAAAGkAAAAAAAAA0gAAAAAOTku//MUZAkAAAGkAAAAAAAAA0gAAAAANVVV")
-        self.test_png_bytes = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+        self.test_png_bytes = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAMAAAADCAYAAABWKLW/AAAAEklEQVR42mNk+P+/ngEKGHFyAK2mB3vQeaNWAAAAAElFTkSuQmCC")
 
         self.audio_blob = MediaBlob.get_or_create_from_blob(project=self.bot.project, blob=self.test_mp3_bytes, content_type="audio/mp3")
 
@@ -482,6 +484,15 @@ class TestZoomBot(TransactionTestCase):
         self.assertEqual(post_processing_completed_event.event_type, BotEventTypes.POST_PROCESSING_COMPLETED)
         self.assertEqual(post_processing_completed_event.old_state, BotStates.POST_PROCESSING)
         self.assertEqual(post_processing_completed_event.new_state, BotStates.ENDED)
+
+        # Verify that a charge was created
+        credit_transaction = CreditTransaction.objects.filter(bot=self.bot).first()
+        self.assertIsNotNone(credit_transaction, "No credit transaction was created for the bot")
+        self.assertEqual(credit_transaction.organization, self.organization)
+        self.assertLess(credit_transaction.centicredits_delta, 0, "Credit transaction should have a negative delta (charge)")
+        self.assertEqual(credit_transaction.centicredits_delta, -self.bot.centicredits_consumed(), "Credit transaction should have a negative delta (charge)")
+        self.assertEqual(credit_transaction.bot, self.bot)
+        self.assertEqual(credit_transaction.organization.centicredits, 500 - self.bot.centicredits_consumed())
 
         # Verify expected SDK calls
         mock_zoom_sdk_adapter.InitSDK.assert_called_once()
@@ -787,7 +798,11 @@ class TestZoomBot(TransactionTestCase):
             adapter.virtual_audio_mic_event_passthrough.onMicStartSendCallback()
 
             # simulate video source initialized
-            adapter.virtual_camera_video_source.onInitializeCallback(MagicMock(), None, None)
+            mock_suggest_cap = MagicMock()
+            mock_suggest_cap.width = 640
+            mock_suggest_cap.height = 480
+            mock_suggest_cap.frame = 30
+            adapter.virtual_camera_video_source.onInitializeCallback(MagicMock(), [], mock_suggest_cap)
 
             # simulate video source started
             adapter.virtual_camera_video_source.onStartSendCallback()
@@ -963,12 +978,13 @@ class TestZoomBot(TransactionTestCase):
             any_order=True,
         )
 
+        yuv_image, yuv_image_width, yuv_image_height = png_to_yuv420_frame(self.test_png_bytes)
         controller.adapter.video_sender.sendVideoFrame.assert_has_calls(
             [
                 call(
-                    png_to_yuv420_frame(self.test_png_bytes),
+                    scale_i420(yuv_image, (yuv_image_width, yuv_image_height), (640, 480)),
                     640,
-                    360,
+                    480,
                     0,
                     mock_zoom_sdk_adapter.FrameDataFormat_I420_FULL,
                 )
@@ -1071,7 +1087,11 @@ class TestZoomBot(TransactionTestCase):
             adapter.virtual_audio_mic_event_passthrough.onMicStartSendCallback()
 
             # simulate video source initialized
-            adapter.virtual_camera_video_source.onInitializeCallback(MagicMock(), None, None)
+            mock_suggest_cap = MagicMock()
+            mock_suggest_cap.width = 640
+            mock_suggest_cap.height = 480
+            mock_suggest_cap.frame = 30
+            adapter.virtual_camera_video_source.onInitializeCallback(MagicMock(), [], mock_suggest_cap)
 
             # simulate video source started
             adapter.virtual_camera_video_source.onStartSendCallback()

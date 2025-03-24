@@ -103,6 +103,14 @@ For more details, follow [this guide](https://developers.zoom.us/docs/meeting-sd
 - Paste the link into your browser to confirm your account.
 - You should now be able to log in, input your credentials and obtain an API key. API calls should be directed to http://localhost:8000 instead of https://app.attendee.dev.
 
+
+## Contribute 
+
+Attendee is open source. TThe best way to contribute is to open an issue or join the [Slack Community](https://join.slack.com/t/attendeecommu-rff8300/shared_invite/zt-2uhpam6p2-ZzLAoVrljbL2UEjqdSHrgQ) and let us know what you want to build.
+
+See CONTRIBUTING.md for detailed instructions on how to contribute to Attendee.
+
+
 ## Roadmap
 
 - [x] Join and leave Zoom meetings

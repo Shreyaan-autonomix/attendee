@@ -10,6 +10,7 @@ import numpy as np
 import zoom_meeting_sdk as zoom
 
 from bots.bot_adapter import BotAdapter
+from bots.utils import png_to_yuv420_frame, scale_i420
 
 from .video_input_manager import VideoInputManager
 
@@ -130,6 +131,7 @@ class ZoomBotAdapter(BotAdapter):
         self.virtual_camera_video_source = None
         self.video_source_helper = None
         self.video_frame_size = (1920, 1080)
+        self.send_image_timeout_id = None
 
         self.automatic_leave_configuration = automatic_leave_configuration
 
@@ -157,6 +159,8 @@ class ZoomBotAdapter(BotAdapter):
         self._participant_cache = {}
 
         self.meeting_status = None
+
+        self.suggested_video_cap = None
 
     def on_user_join_callback(self, joined_user_ids, _):
         logger.info(f"on_user_join_callback called. joined_user_ids = {joined_user_ids}")
@@ -394,20 +398,45 @@ class ZoomBotAdapter(BotAdapter):
         # As soon as we get this callback, we need to send a blank frame and it will fail with SDKERR_WRONG_USAGE
         # Then the callback will be triggered again and subsequent calls will succeed.
         # Not sure why this happens.
-        if self.video_sender and not self.on_virtual_camera_start_send_callback_called:
-            blank = create_black_yuv420_frame(640, 360)
-            initial_send_video_frame_response = self.video_sender.sendVideoFrame(blank, 640, 360, 0, zoom.FrameDataFormat_I420_FULL)
+        if self.video_sender and not self.on_virtual_camera_start_send_callback_called and self.suggested_video_cap:
+            blank = create_black_yuv420_frame(self.suggested_video_cap.width, self.suggested_video_cap.height)
+            initial_send_video_frame_response = self.video_sender.sendVideoFrame(blank, self.suggested_video_cap.width, self.suggested_video_cap.height, 0, zoom.FrameDataFormat_I420_FULL)
             logger.info(f"initial_send_video_frame_response = {initial_send_video_frame_response}")
         self.on_virtual_camera_start_send_callback_called = True
 
     def on_virtual_camera_initialize_callback(self, video_sender, support_cap_list, suggest_cap):
+        logger.info(f"on_virtual_camera_initialize_callback called with support_cap_list = {list(map(lambda x: f'{x.width}x{x.height}x{x.frame}', support_cap_list))} suggest_cap = {suggest_cap.width}x{suggest_cap.height}x{suggest_cap.frame}")
         self.video_sender = video_sender
+        self.suggested_video_cap = suggest_cap
 
-    def send_raw_image(self, yuv420_image_bytes):
+    def send_raw_image(self, png_image_bytes):
         if not self.on_virtual_camera_start_send_callback_called:
             raise Exception("on_virtual_camera_start_send_callback_called not called so cannot send raw image")
-        send_video_frame_response = self.video_sender.sendVideoFrame(yuv420_image_bytes, 640, 360, 0, zoom.FrameDataFormat_I420_FULL)
-        logger.info(f"send_raw_image send_video_frame_response = {send_video_frame_response}")
+
+        if not self.suggested_video_cap:
+            logger.error("suggested_video_cap is None so cannot send raw image")
+            return
+
+        yuv420_image_bytes, original_width, original_height = png_to_yuv420_frame(png_image_bytes)
+        # We have to scale the image to the zoom video capability width and height for it to display properly
+        yuv420_image_bytes_scaled = scale_i420(yuv420_image_bytes, (original_width, original_height), (self.suggested_video_cap.width, self.suggested_video_cap.height))
+
+        self.current_image_to_send = yuv420_image_bytes_scaled
+
+        # Add a timeout to send the image every 500ms if one isn't already active
+        if self.send_image_timeout_id is None:
+            self.send_image_timeout_id = GLib.timeout_add(500, self.send_current_image_to_zoom)
+
+    def send_current_image_to_zoom(self):
+        if self.requested_leave or self.cleaned_up or (not self.suggested_video_cap) or (not self.current_image_to_send):
+            self.send_image_timeout_id = None
+            return False
+
+        send_video_frame_response = self.video_sender.sendVideoFrame(self.current_image_to_send, self.suggested_video_cap.width, self.suggested_video_cap.height, 0, zoom.FrameDataFormat_I420_FULL)
+        if send_video_frame_response != zoom.SDKERR_SUCCESS:
+            logger.info(f"send_current_image_to_zoom failed with send_video_frame_response = {send_video_frame_response}")
+
+        return True
 
     def set_up_bot_audio_input(self):
         if self.audio_helper is None:

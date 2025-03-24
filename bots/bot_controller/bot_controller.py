@@ -38,6 +38,7 @@ from .closed_caption_manager import ClosedCaptionManager
 from .file_uploader import FileUploader
 from .gstreamer_pipeline import GstreamerPipeline
 from .individual_audio_input_manager import IndividualAudioInputManager
+from .media_recorder_receiver import MediaRecorderReceiver
 from .pipeline_configuration import PipelineConfiguration
 from .rtmp_client import RTMPClient
 
@@ -55,11 +56,12 @@ class BotController:
             display_name=self.bot_in_db.name,
             send_message_callback=self.on_message_from_adapter,
             meeting_url=self.bot_in_db.meeting_url,
-            add_video_frame_callback=self.gstreamer_pipeline.on_new_video_frame,
-            wants_any_video_frames_callback=self.gstreamer_pipeline.wants_any_video_frames,
-            add_mixed_audio_chunk_callback=self.gstreamer_pipeline.on_mixed_audio_raw_data_received_callback,
+            add_video_frame_callback=None,
+            wants_any_video_frames_callback=None,
+            add_mixed_audio_chunk_callback=None,
             upsert_caption_callback=self.closed_caption_manager.upsert_caption,
             automatic_leave_configuration=self.automatic_leave_configuration,
+            add_encoded_mp4_chunk_callback=self.media_recorder_receiver.on_encoded_mp4_chunk,
         )
 
     def get_teams_bot_adapter(self):
@@ -74,6 +76,7 @@ class BotController:
             add_mixed_audio_chunk_callback=self.gstreamer_pipeline.on_mixed_audio_raw_data_received_callback,
             upsert_caption_callback=self.closed_caption_manager.upsert_caption,
             automatic_leave_configuration=self.automatic_leave_configuration,
+            add_encoded_mp4_chunk_callback=None,
         )
 
     def get_zoom_bot_adapter(self):
@@ -137,9 +140,13 @@ class BotController:
             return self.get_teams_bot_adapter()
 
     def get_first_buffer_timestamp_ms(self):
-        if self.gstreamer_pipeline.start_time_ns is None:
-            return None
-        return int(self.gstreamer_pipeline.start_time_ns / 1_000_000) + self.adapter.get_first_buffer_timestamp_ms_offset()
+        if self.media_recorder_receiver:
+            return self.adapter.get_first_buffer_timestamp_ms()
+
+        if self.gstreamer_pipeline:
+            if self.gstreamer_pipeline.start_time_ns is None:
+                return None
+            return int(self.gstreamer_pipeline.start_time_ns / 1_000_000) + self.adapter.get_first_buffer_timestamp_ms_offset()
 
     def recording_file_saved(self, s3_storage_key):
         recording = Recording.objects.get(bot=self.bot_in_db, is_default_recording=True)
@@ -209,16 +216,20 @@ class BotController:
         if self.main_loop and self.main_loop.is_running():
             self.main_loop.quit()
 
-        if self.get_gstreamer_file_location():
+        if self.media_recorder_receiver:
+            logger.info("Telling media recorder receiver to cleanup...")
+            self.media_recorder_receiver.cleanup()
+
+        if self.get_recording_file_location():
             logger.info("Telling file uploader to upload recording file...")
             file_uploader = FileUploader(
                 os.environ.get("AWS_RECORDING_STORAGE_BUCKET_NAME"),
                 self.get_recording_filename(),
             )
-            file_uploader.upload_file(self.get_gstreamer_file_location())
+            file_uploader.upload_file(self.get_recording_file_location())
             file_uploader.wait_for_upload()
             logger.info("File uploader finished uploading file")
-            file_uploader.delete_file(self.get_gstreamer_file_location())
+            file_uploader.delete_file(self.get_recording_file_location())
             logger.info("File uploader deleted file from local filesystem")
             self.recording_file_saved(file_uploader.key)
 
@@ -254,11 +265,25 @@ class BotController:
         else:
             return GstreamerPipeline.OUTPUT_FORMAT_MP4
 
-    def get_gstreamer_file_location(self):
+    def get_recording_file_location(self):
         if self.pipeline_configuration.rtmp_stream_audio or self.pipeline_configuration.rtmp_stream_video:
             return None
         else:
             return os.path.join("/tmp", self.get_recording_filename())
+
+    def should_create_gstreamer_pipeline(self):
+        # For google meet, we're doing a media recorder based recording technique that does the video processing in the browser
+        # so we don't need to create a gstreamer pipeline here
+        meeting_type = self.get_meeting_type()
+        if meeting_type == MeetingTypes.ZOOM:
+            return True
+        elif meeting_type == MeetingTypes.GOOGLE_MEET:
+            return False
+        elif meeting_type == MeetingTypes.TEAMS:
+            return True
+
+    def should_create_media_recorder_receiver(self):
+        return not self.should_create_gstreamer_pipeline()
 
     def run(self):
         if self.run_called:
@@ -289,16 +314,24 @@ class BotController:
             self.rtmp_client = RTMPClient(rtmp_url=self.bot_in_db.rtmp_destination_url())
             self.rtmp_client.start()
 
-        self.gstreamer_pipeline = GstreamerPipeline(
-            on_new_sample_callback=self.on_new_sample_from_gstreamer_pipeline,
-            video_frame_size=(1920, 1080),
-            audio_format=self.get_audio_format(),
-            output_format=self.get_gstreamer_output_format(),
-            num_audio_sources=self.get_num_audio_sources(),
-            sink_type=self.get_gstreamer_sink_type(),
-            file_location=self.get_gstreamer_file_location(),
-        )
-        self.gstreamer_pipeline.setup()
+        self.gstreamer_pipeline = None
+        if self.should_create_gstreamer_pipeline():
+            self.gstreamer_pipeline = GstreamerPipeline(
+                on_new_sample_callback=self.on_new_sample_from_gstreamer_pipeline,
+                video_frame_size=(1920, 1080),
+                audio_format=self.get_audio_format(),
+                output_format=self.get_gstreamer_output_format(),
+                num_audio_sources=self.get_num_audio_sources(),
+                sink_type=self.get_gstreamer_sink_type(),
+                file_location=self.get_recording_file_location(),
+            )
+            self.gstreamer_pipeline.setup()
+
+        self.media_recorder_receiver = None
+        if self.should_create_media_recorder_receiver():
+            self.media_recorder_receiver = MediaRecorderReceiver(
+                file_location=self.get_recording_file_location(),
+            )
 
         self.adapter = self.get_bot_adapter()
 
@@ -382,8 +415,6 @@ class BotController:
             BotMediaRequestManager.set_media_request_failed_to_play(oldest_enqueued_media_request)
 
     def take_action_based_on_image_media_requests_in_db(self):
-        from bots.utils import png_to_yuv420_frame
-
         media_type = BotMediaRequestMediaTypes.IMAGE
 
         # Get all enqueued image media requests for this bot, ordered by creation time
@@ -398,7 +429,7 @@ class BotController:
         # Mark the most recent request as FINISHED
         try:
             BotMediaRequestManager.set_media_request_playing(most_recent_request)
-            self.adapter.send_raw_image(png_to_yuv420_frame(most_recent_request.media_blob.blob))
+            self.adapter.send_raw_image(most_recent_request.media_blob.blob)
             BotMediaRequestManager.set_media_request_finished(most_recent_request)
         except Exception as e:
             logger.info(f"Error sending raw image: {e}")

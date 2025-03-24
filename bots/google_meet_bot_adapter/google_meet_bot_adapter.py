@@ -10,3 +10,6 @@ class GoogleMeetBotAdapter(WebBotAdapter, GoogleMeetUIMethods):
 
     def get_websocket_port(self):
         return 8765
+
+    def get_first_buffer_timestamp_ms(self):
+        return self.media_sending_enable_timestamp_ms
